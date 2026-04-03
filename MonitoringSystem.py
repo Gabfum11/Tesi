@@ -10,6 +10,7 @@ from SitToStandTest import SitToStandTest
 from Daily_monitor import DailyMonitor
 from Database_manager import DatabaseManager
 from Contextanalyzer import ContextAnalyzer
+from Dataaggregator import DataAggregator
 from c500 import CameraController
 import os
 from dotenv import load_dotenv
@@ -37,6 +38,7 @@ class MonitoringSystem:
         self.detector.set_history_size(10)
         self.daily_monitor = DailyMonitor()
         self.db = DatabaseManager()
+        self.aggregator = DataAggregator(self.db.db_path)
 
         # Test
         self.tug_test = TUGTest()
@@ -45,7 +47,7 @@ class MonitoringSystem:
         self.current_test_id = None
 
         # Calibrazione distanza (ora nel detector)
-        self.detector.load_distance_calibration()
+        #self.detector.load_distance_calibration()
 
         # Analisi contestuale (Vision LLM)
         load_dotenv()
@@ -107,8 +109,11 @@ class MonitoringSystem:
                     self.detector.hip_y,
                     self.detector.pixels_per_meter,
                     self.detector.left_ankle_y,
-                    self.detector.right_ankle_y
-                    
+                    self.detector.right_ankle_y,
+                    self.detector.left_ankle_x,
+                    self.detector.right_ankle_x,
+                    self.detector.shoulder_mid_x, 
+                    self.detector.shoulder_mid_y
                 )
 
                 self._update_tests(state, knee_angle, movement, frame)
@@ -130,14 +135,25 @@ class MonitoringSystem:
 
             # === ANALISI CONTESTUALE (Vision LLM) ===
             # Periodico
-            snapshot = self.context.update(frame)
+            if pose_detected:
+                context = self._build_vlm_context(state)
+            else:
+                context = {'state': 'UNKNOWN', 'state_duration_sec': 0}
+            snapshot = self.context.update(frame, context)
             if snapshot:
                 self._save_snapshot(snapshot)
 
             self._draw_overlay(frame)
             self.current_frame = frame
             cv2.imshow("Monitoring", frame)
-
+            # FPS reale
+            if not hasattr(self, '_fps_counter'):
+                self._fps_counter = 0
+                self._fps_start = time.time()
+            self._fps_counter += 1
+            if self._fps_counter % 100 == 0:
+                real_fps = self._fps_counter / (time.time() - self._fps_start)
+                print(f"[FPS] {real_fps:.1f}")
             key = cv2.waitKeyEx(1)
             self._handle_input(key)
 
@@ -171,7 +187,39 @@ class MonitoringSystem:
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
             if self.sts_test.reps >= 5:
                 self._save_sts_result()
+    def _build_vlm_context(self, state):
+        """Costruisce il contesto corrente per il ContextAnalyzer."""
+        # Durata nello stato corrente
+        if state == self.daily_monitor.prev_state:
+            state_duration = time.time() - self.daily_monitor.prev_time
+        else:
+            state_duration = 0
 
+        # Ultima simmetria disponibile
+        last_symmetry = None
+        if self.daily_monitor.walking_episodes:
+            last_ep = self.daily_monitor.walking_episodes[-1]
+            last_symmetry = last_ep.get('symmetry')
+
+        # Ultimo sit-to-stand
+        last_sts_time = None
+        if self.daily_monitor.sit_to_stand_times:
+            last_sts_time = self.daily_monitor.sit_to_stand_times[-1]
+
+        # Inattivita' corrente
+        inactivity = time.time() - self.daily_monitor.current_inactivity_start
+
+        return {
+            'state': state,
+            'state_duration_sec': state_duration,
+            'movement': self.detector.last_movement,
+            'speed_ms': self.detector.get_speed_ms(),
+            'knee_angle': self.detector.last_knee_angle,
+            'symmetry': last_symmetry,
+            'last_sit_to_stand_time': last_sts_time,
+            'current_test': self.current_test,
+            'inactivity_sec': inactivity
+    }
     def _handle_input(self, key):
         if key == ord('s'):
             self._start_tug()
@@ -232,6 +280,7 @@ class MonitoringSystem:
         self.db.save_context_snapshot(snapshot)
 
     def _shutdown(self):
+        # ── 1. Salva tutti i dati giornalieri nel DB ──
         summary = self.daily_monitor.get_summary()
         self.db.save_daily_summary(summary)
         print(f"Daily summary salvato per {summary['date']}")
@@ -260,13 +309,60 @@ class MonitoringSystem:
                 self.db.save_context_snapshot(snap)
         print(f"Totale snapshot contestuali: {len(self.context.get_snapshots())}")
 
+        # ── 2. Aggregazione e analisi trend ──
+        print("\n" + "=" * 50)
+        print("RIEPILOGO AGGREGATO")
+        print("=" * 50)
+
+        weekly = self.aggregator.get_weekly_summary()
+        trend = self.aggregator.get_trend_analysis()
+
+        # Stampa riepilogo settimanale
+        if weekly["days_monitored"] > 0:
+            avg = weekly["daily_averages"]
+            print(f"\n--- Settimana ({weekly['period_start']} → {weekly['period_end']}) ---")
+            print(f"  Giorni monitorati: {weekly['days_monitored']}")
+            print(f"  Cammino medio/giorno: {avg.get('avg_time_walking_min', 0):.1f} min")
+            print(f"  Alzate medie/giorno:  {avg.get('avg_num_sit_to_stand', 0):.1f}")
+            print(f"  Indipendenza media:   {avg.get('avg_independence_score', 0):.0f}%")
+
+            gait = weekly.get("gait", {})
+            if gait.get("avg_speed_ms"):
+                print(f"  Velocità cammino:     {gait['avg_speed_ms']:.2f} m/s")
+            if gait.get("avg_cadence"):
+                print(f"  Cadenza:              {gait['avg_cadence']:.0f} passi/min")
+            if gait.get("avg_symmetry"):
+                print(f"  Simmetria:            {gait['avg_symmetry']:.0f}%")
+
+        # Stampa trend
+        if trend.get("status") == "ok":
+            print(f"\n--- Trend vs settimana precedente ---")
+            for key, entry in trend["trends"].items():
+                if entry["previous"] > 0:
+                    symbol = "↑" if entry["change_pct"] > 0 else "↓" if entry["change_pct"] < 0 else "="
+                    interp = entry["interpretation"].upper()
+                    print(f"  {entry['label']}: {entry['current']:.1f} "
+                          f"{symbol} {abs(entry['change_pct']):.0f}% [{interp}]")
+        else:
+            print(f"\n  Trend: {trend.get('message', 'dati insufficienti')}")
+
+        # Stampa alert
+        alerts = trend.get("alerts", []) or weekly.get("alerts", [])
+        if alerts:
+            print(f"\n--- Alert ({len(alerts)}) ---")
+            for a in alerts:
+                tag = "[WARN]" if a["level"] == "warning" else "[CRIT]" if a["level"] == "critical" else "[OK]" if a["level"] == "positive" else "[INFO]"
+                print(f"  {tag} {a['message']}")
+
+        print("=" * 50)
+
         cv2.destroyAllWindows()
         print("Sistema chiuso, dati salvati.")
 
 
 if __name__ == "__main__":
     system = MonitoringSystem(
-        monitor_index=1,
+        monitor_index=2,
         display_width=1280
     )
     start = time.time()

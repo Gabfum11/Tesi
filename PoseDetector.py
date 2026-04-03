@@ -66,6 +66,10 @@ class PoseDetector:
         self.ankle_diff_history=deque(maxlen=15)
         self.left_ankle_y = 0
         self.right_ankle_y = 0
+        self.left_ankle_x = 0
+        self.right_ankle_x = 0
+        self.shoulder_mid_x = 0
+        self.shoulder_mid_y = 0
         #storico pixel
         self.hip_x_raw_history = deque(maxlen=self.history_size)
         self.hip_y_raw_history = deque(maxlen=self.history_size)
@@ -270,6 +274,10 @@ class PoseDetector:
         self.hip_y = hip_y_px  # Sempre pixel
         self.left_ankle_y = self.lmList[27][2]
         self.right_ankle_y = self.lmList[28][2]
+        self.left_ankle_x=self.lmList[27][1]
+        self.right_ankle_x=self.lmList[28][1]
+        self.shoulder_mid_x = (self.lmList[11][1] + self.lmList[12][1]) / 2
+        self.shoulder_mid_y = (self.lmList[11][2] + self.lmList[12][2]) / 2
         self.hip_x_raw_history.append(hip_x_px)
         self.hip_y_raw_history.append(hip_y_px)
         if len(self.ankle_y_history_left) >= 10:
@@ -321,7 +329,7 @@ class PoseDetector:
         elif current_test == "STS":
             movement_threshold = 15
         else:
-            movement_threshold = 4
+            movement_threshold = 5
         
         # Landmark principali
         nose = lmList_to_use[0]
@@ -357,9 +365,16 @@ class PoseDetector:
         self.knee_angle_history.append(knee_angle)
         self.last_knee_angle = knee_angle
         recently_sitting = self.posture_history.count('SITTING') > 3
-        stepping = self.step_activity > 30 or (self.step_activity > 15 and movement > 2)
+        stepping = self.step_activity > 30 and knee_angle>140
         # Classificazione postura
-        if knee_angle < 140 and movement < movement_threshold and not stepping:
+        was_sitting = self.posture_history[-1] == 'SITTING' if self.posture_history else False
+
+        if was_sitting:
+            sit_threshold = 150  # più alto per restare seduto
+        else:
+            sit_threshold = 140  # più basso per diventare seduto
+
+        if knee_angle < sit_threshold and movement < movement_threshold:
             posture = 'SITTING'
         elif (movement > movement_threshold or stepping) and not recently_sitting:
             posture = 'WALKING'

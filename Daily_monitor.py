@@ -75,6 +75,9 @@ class DailyMonitor:
         self.slot_walking = 0
         self.slot_sit_to_stand = 0
         self.completed_slots = []
+        #frame
+        self._no_tracking_frames = 0
+        self._had_tracking_gap = False
 
     def _log_event(self, event_type, duration=None, details=None):
         """Registra un evento con timestamp"""
@@ -122,17 +125,14 @@ class DailyMonitor:
         self.frames_total += 1
         if pose_detected:
             self.frames_with_pose += 1
-            if hasattr(self, '_no_tracking_frames'):
-                self._no_tracking_frames = 0
+            self._no_tracking_frames = 0
 
         if not pose_detected:
-            if not hasattr(self, '_no_tracking_frames'):
-                self._no_tracking_frames = 0
             self._no_tracking_frames += 1
             
             # Chiudi episodio di cammino se era aperto
             if self._no_tracking_frames > 5 and self.current_walk_start is not None:
-                self.track_walking("STANDING", None, None, None, 0, 0)
+                self.track_walking("STANDING", None, None, None, 0, 0, None, None,None,None)
             
             # Resetta stato dopo troppi frame senza tracking
             if self._no_tracking_frames > 10:
@@ -229,7 +229,7 @@ class DailyMonitor:
         self.prev_time = current_time
 
     def track_walking(self, state, hip_x, hip_y, pixels_per_meter,
-                      left_ankle_y, right_ankle_y):
+                      left_ankle_y, right_ankle_y, left_ankle_x,right_ankle_x, shoulder_mid_x, shoulder_mid_y):
         """Tracking episodi di cammino + analisi andatura."""
         current_time = time.time()
         dt = current_time - self.prev_time if self.prev_time else 0
@@ -273,7 +273,7 @@ class DailyMonitor:
             # Alimenta il GaitAnalyzer con le posizioni delle caviglie
             if left_ankle_y is not None and right_ankle_y is not None:
                 #print(f"[DEBUG] Ankles Y: L={left_ankle_y:.1f}, R={right_ankle_y:.1f}")
-                self.gait_analyzer.update(left_ankle_y, right_ankle_y, current_time)
+                self.gait_analyzer.update(left_ankle_y, right_ankle_y, current_time,hip_x,hip_y, left_ankle_x,right_ankle_x, shoulder_mid_x, shoulder_mid_y)
 
             self.prev_hip_x = hip_x
             self.prev_hip_y = hip_y
@@ -298,16 +298,22 @@ class DailyMonitor:
                     'cadence': gait['cadence'] if gait else None,
                     'symmetry': gait['symmetry'] if gait else None,
                     'regularity': gait['regularity'] if gait else None,
-                    'total_steps': gait['total_steps'] if gait else None
+                    'total_steps': gait['total_steps'] if gait else None,
+                    'reliability_score': gait['reliability_score'] if gait else None,
+                    'signal_used': gait['signal_used'] if gait else None
                 }
                 self.walking_episodes.append(episode)
 
                 gait_str = ""
                 if gait:
-                    gait_str = (f"  Cadenza: {gait['cadence']}p/min"
+                   gait_str = ( f"  Cadenza: {gait['cadence']}p/min"
                                 f"  Simm: {gait['symmetry']}%"
                                 f"  Reg: {gait['regularity']}%"
-                                f"  Passi: {gait['total_steps']}")
+                                f"  Passi: {gait['total_steps']}"
+                                f"  Rel: {gait['reliability']}({gait['reliability_score']})"
+                                f"  Sig: {gait['signal_used']}"
+                                f"  SwayL: {gait['trunk_sway_lateral']}"
+                                f"  SwayV: {gait['trunk_sway_vertical']}")
                 self._log_event("WALK_END", duration=duration, details={
                     'duration_sec': round(duration, 2),
                     'distance_m': round(distance_m, 2) if distance_m else None,

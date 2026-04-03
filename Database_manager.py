@@ -1,6 +1,6 @@
 import sqlite3
 from datetime import date, datetime
-
+import json
 
 class DatabaseManager:
     def __init__(self, db_path="monitoring.db"):
@@ -89,6 +89,8 @@ class DatabaseManager:
                 symmetry REAL,
                 regularity REAL,
                 total_steps INTEGER,
+                reliability_score INTEGER,
+                signal_used TEXT,
                 FOREIGN KEY(summary_date) REFERENCES daily_summary(date)
             )
         ''')
@@ -125,6 +127,9 @@ class DatabaseManager:
                 summary_date TEXT,
                 timestamp TEXT,
                 description TEXT,
+                parsed_json TEXT,
+                context_json TEXT,
+                state TEXT,
                 FOREIGN KEY(summary_date) REFERENCES daily_summary(date)
             )
         ''')
@@ -224,7 +229,14 @@ class DatabaseManager:
         cursor = self.connect()
         cursor.execute('''
             INSERT INTO context_snapshot
-            (summary_date, timestamp, description)
-            VALUES (:date, :timestamp,:description)
-        ''', snapshot_data)
+            (summary_date, timestamp, description, parsed_json, context_json, state)
+            VALUES (:date, :timestamp, :description, :parsed_json, :context_json, :state)
+        ''', {
+            'date': snapshot_data.get('date'),
+            'timestamp': snapshot_data.get('timestamp'),
+            'description': snapshot_data.get('description'),
+            'parsed_json': json.dumps(snapshot_data.get('parsed')) if snapshot_data.get('parsed') else None,
+            'context_json': json.dumps(snapshot_data.get('context')) if snapshot_data.get('context') else None,
+            'state': snapshot_data.get('context', {}).get('state') if snapshot_data.get('context') else None
+        })
         self.close()
