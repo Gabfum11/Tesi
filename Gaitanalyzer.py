@@ -465,39 +465,39 @@ class GaitAnalyzer:
     
     def _detrended_std(self, signal):
         """
-        Deviazione standard dopo aver rimosso il trend lineare.
+        Deviazione standard dopo aver rimosso il trend con media mobile.
         
-        Serve perche' durante il cammino le spalle si spostano
-        (trend lineare: la persona va da A a B). Senza detrendizzare,
-        la std misurerebbe lo spostamento totale, non l'oscillazione.
+        Usa una media mobile lenta (finestra ~2 secondi) come trend.
+        I residui catturano solo le oscillazioni rapide passo-passo.
         
-        Esempio: persona cammina dritto per 3 metri.
-          - std grezza: grande (perche' X va da 100 a 400)
-          - std detrendizzata: piccola (solo l'oscillazione laterale)
+        Funziona con percorsi curvi (la persona gira intorno ai mobili)
+        dove la regressione lineare fallirebbe.
+        
+        Esempio: persona cammina in curva per 10 secondi.
+          - std con trend lineare: 150px (la curva non e' una retta)
+          - std con media mobile: 4px (solo l'oscillazione reale)
         """
         n = len(signal)
         if n < 3:
             return None
         
-        # Regressione lineare: y = a + b*x
-        # x = indici [0, 1, 2, ..., n-1]
-        x_mean = (n - 1) / 2
-        y_mean = sum(signal) / n
+        # Finestra di circa 2 secondi: abbastanza lenta da seguire
+        # la traiettoria, abbastanza veloce da non mangiare l'oscillazione
+        window = max(5, int(self.fps * 2.0))
+        # Se la finestra e' piu' grande del segnale, usa tutto
+        if window >= n:
+            window = n - 1 if n > 1 else 1
         
-        numerator = 0
-        denominator = 0
+        # Calcola la media mobile (trend lento)
+        half = window // 2
+        trend = []
         for i in range(n):
-            numerator += (i - x_mean) * (signal[i] - y_mean)
-            denominator += (i - x_mean) ** 2
+            start = max(0, i - half)
+            end = min(n, i + half + 1)
+            trend.append(sum(signal[start:end]) / (end - start))
         
-        if denominator == 0:
-            return 0.0
-        
-        slope = numerator / denominator
-        intercept = y_mean - slope * x_mean
-        
-        # Residui: differenza tra segnale e trend
-        residuals = [signal[i] - (intercept + slope * i) for i in range(n)]
+        # Residui: segnale - trend
+        residuals = [signal[i] - trend[i] for i in range(n)]
         
         if len(residuals) < 2:
             return 0.0

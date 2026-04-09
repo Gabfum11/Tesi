@@ -374,7 +374,7 @@ class PoseDetector:
         else:
             sit_threshold = 140  # più basso per diventare seduto
 
-        if knee_angle < sit_threshold and movement < movement_threshold:
+        if knee_angle < sit_threshold and (movement < movement_threshold or knee_angle<120):
             posture = 'SITTING'
         elif (movement > movement_threshold or stepping) and not recently_sitting:
             posture = 'WALKING'

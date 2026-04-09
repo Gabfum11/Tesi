@@ -124,6 +124,14 @@ class MonitoringSystem:
                             (10, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
                 cv2.putText(frame, f"Steps: {self.detector.step_activity:.1f}",
                             (10, 230), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+                #rising = self.daily_monitor.rising_in_progress
+                #stable = self.daily_monitor.stable_standing_frames
+                #sts_count = len(self.daily_monitor.sit_to_stand_times)
+                #last_sts = f"{self.daily_monitor.sit_to_stand_times[-1]:.1f}s" if self.daily_monitor.sit_to_stand_times else "-"
+                #cv2.putText(frame, f"Rising: {rising}  Stable: {stable}  STS: {sts_count} ({last_sts})",
+                  #          (10, 260), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 200), 2)
+                #cv2.putText(frame, f"Knee: {knee_angle:.0f}  VelY: {self.detector.hip_y_velocity:.1f}",
+                        #    (10, 290), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 200), 2)
                 
                 # Mostra velocità in m/s se calibrato
                 speed_ms = self.detector.get_speed_ms()
