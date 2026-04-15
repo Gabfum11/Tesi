@@ -4,4 +4,4 @@ requests==2.32.5
 numpy>=2.0.0
 mss==10.1.0
 mediapipe==0.10.32
-python-dotenv==1.2.2
+

@@ -3,6 +3,7 @@ import cv2
 import time
 import numpy as np
 import mss
+import json
 from datetime import datetime
 import PoseDetector as pm
 from TugTest import TUGTest
@@ -12,22 +13,23 @@ from Database_manager import DatabaseManager
 from Contextanalyzer import ContextAnalyzer
 from Dataaggregator import DataAggregator
 from c500 import CameraController
-import os
-from dotenv import load_dotenv
 
 class MonitoringSystem:
     def __init__(self, monitor_index=1, display_width=1280):
+        # Screen capture con mss
+        self.sct = mss.mss()
+        full_monitor = self.sct.monitors[1]
+        screen_w = full_monitor["width"]
+        screen_h = full_monitor["height"]
         self.display_width = display_width
         self.video_source = f"monitor_{monitor_index}"
 
         # Telecamera
         self.cam_ctrl = CameraController()
-
-        # Screen capture con mss
-        self.sct = mss.mss()
-        self.monitor = self.sct.monitors[monitor_index]
+        self.monitor = {"top": 200, "left": 88, "width": 800, "height": 600}  # Monitor 1: area di interesse (da calibrare)
         self.frame_width = self.monitor["width"]
         self.frame_height = self.monitor["height"]
+        
         self.is_file = False
 
         # Componenti
@@ -49,13 +51,10 @@ class MonitoringSystem:
         # Calibrazione distanza (ora nel detector)
         #self.detector.load_distance_calibration()
 
-        # Analisi contestuale (Vision LLM)
-        load_dotenv()
+
+       
         # Recupera la chiave
-        api_key = os.getenv("GROQ_API_KEY")
-        if not api_key:
-            raise ValueError("API Key non trovata! Verifica il file .env")
-        self.context = ContextAnalyzer(api_key)
+        self.context = ContextAnalyzer(model="gemma4:e2b")
 
         # Calcola dimensioni display
         self.needs_resize = self.frame_width > self.display_width
@@ -71,6 +70,10 @@ class MonitoringSystem:
         print(f"Modalità: Screen capture (monitor {monitor_index})")
 
     def run(self):
+         # Finestra monitoring: metà destra, in alto
+        cv2.namedWindow("Monitoring", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Monitoring", self.monitor["width"], self.monitor["height"] // 2)
+        cv2.moveWindow("Monitoring", self.monitor["width"], 0)
         while True:
             # Cattura schermo con mss
             sct_img = self.sct.grab(self.monitor)
@@ -115,7 +118,12 @@ class MonitoringSystem:
                     self.detector.shoulder_mid_x, 
                     self.detector.shoulder_mid_y
                 )
-
+                # === TRIGGER ADATTIVI LLM ===
+                should, reason = self.context.should_trigger(context)
+                if should:
+                    snapshot = self.context.trigger(frame, context, reason)
+                    if snapshot:
+                        self._save_snapshot(snapshot)
                 self._update_tests(state, knee_angle, movement, frame)
 
                 cv2.putText(frame, f"Stato: {state}", (10, 80),
@@ -284,8 +292,15 @@ class MonitoringSystem:
 
     def _save_snapshot(self, snapshot):
         """Salva uno snapshot contestuale nel DB."""
-        snapshot['date'] = self.daily_monitor.date
-        self.db.save_context_snapshot(snapshot)
+        snapshot_data = {
+        'date': self.daily_monitor.date,
+        'timestamp': snapshot.get('timestamp'),
+        'description': snapshot.get('description'),
+        'parsed_json': json.dumps(snapshot.get('structured')) if snapshot.get('structured') else None,
+        'context_json': json.dumps(snapshot.get('context')) if snapshot.get('context') else None,
+        'state': snapshot.get('context', {}).get('state') if snapshot.get('context') else None
+        }
+        self.db.save_context_snapshot(snapshot_data)
 
     def _shutdown(self):
         # ── 1. Salva tutti i dati giornalieri nel DB ──
@@ -370,7 +385,7 @@ class MonitoringSystem:
 
 if __name__ == "__main__":
     system = MonitoringSystem(
-        monitor_index=2,
+        monitor_index=1,
         display_width=1280
     )
     start = time.time()
