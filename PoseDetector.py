@@ -322,9 +322,13 @@ class PoseDetector:
         self.ankle_y_history_right.append(self.right_ankle_y)
 
         # Velocità verticale anca (per detect sit-to-stand)
-        if len(self.hip_y_raw_history) >= 2:
-            delta_px = self.hip_y_raw_history[-1] - self.hip_y_raw_history[-2]
-            self.hip_y_velocity = delta_px * self.fps
+        # Finestra di 3 frame: toglie il jitter (±1px → ±8 invece di ±24)
+        # ma resta reattiva per rilevare l'alzata (-100 a -400)
+        vel_window = 3
+        if len(self.hip_y_raw_history) >= vel_window:
+            delta_px = self.hip_y_raw_history[-1] - self.hip_y_raw_history[-vel_window]
+            dt_sec = vel_window / self.fps
+            self.hip_y_velocity = delta_px / dt_sec if dt_sec > 0 else 0
         
         # Step activity: oscillazione caviglie su finestra temporale
         if len(self.ankle_y_history_left) >= self._step_window:
@@ -490,13 +494,13 @@ class PoseDetector:
             self._walking_exit_frames = 0
                 
         self.posture_history.append(posture)
-        """
+        
         # DEBUG: stampa 1 volta al secondo
         if self.frame_count % int(self.fps) == 0:
             print(f"[POSTURE DEBUG] mov={movement:.1f} step={self.step_activity:.1f} "
                   f"knee={knee_angle:.0f} cooldown={self._sit_cooldown}/{self._sit_cooldown_threshold} "
                   f"stepping={stepping} moving={moving} exit={self._walking_exit_frames} → {posture}")
-        """
+        
         return posture
 
     # =========================================
