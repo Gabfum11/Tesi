@@ -30,7 +30,6 @@ class DailyMonitor:
         self.num_sit_to_stand = 0
         self.num_stand_to_sit = 0
         self.num_walkings = 0
-        self._recent_transitions = deque(maxlen=10)  
 
         # Sit-to-stand timing
         self.sit_to_stand_times = []
@@ -48,11 +47,22 @@ class DailyMonitor:
         self.rising_in_progress = False
         self.rising_start_time = None  # timestamp di inizio alzata
         self.stable_standing_frames = 0
-        # Soglia velocità SMOOTHATA (media 5 frame):
-        # Jitter da fermo: ±12 instantaneo → media ~0 → STABILE
-        # Alzata lenta: -24 costante → media ~-20 → NON STABILE
-        # Alzata veloce: -100+ → media ~-80 → NON STABILE
-        self._stable_velocity_threshold = 15
+        
+        # Soglie velocità (separate per i due usi):
+        #
+        # 1. Stabilità post-alzata (usata su media 5 frame nel check rising):
+        #    La media 5 frame riduce il jitter quasi a 0, quindi soglia bassa
+        self._stable_velocity_threshold = 10
+        #
+        # 2. Ricerca inizio alzata in _find_rising_start (usata su singoli valori):
+        #    I valori dal PoseDetector sono già smoothati su 3 frame (jitter ~±8)
+        #    Soglia leggermente più alta per tollerare il jitter residuo
+        self._calm_velocity_threshold = 12
+        #
+        # 3. Calm streak: quanti frame consecutivi "calmi" servono per delimitare
+        #    l'inizio dell'alzata (~0.25s, adattivo agli FPS)
+        self._calm_streak_required = 6  # ricalcolato se si conosce il fps
+        
         # Timeout: se il rising dura più di 5s, qualcosa è andato storto
         self._rising_timeout = 5.0
 
@@ -90,9 +100,6 @@ class DailyMonitor:
         self._no_tracking_frames = 0
         self._had_tracking_gap = False
 
-        _buf = getattr(self, 'event_buffer', None)
-        self.event_buffer = _buf
-
     def _log_event(self, event_type, duration=None, details=None):
         """Registra un evento con timestamp"""
         self.events.append({
@@ -121,9 +128,9 @@ class DailyMonitor:
         
         for i in range(peak_idx, -1, -1):
             t, vel = self.recent_velocities[i]
-            if abs(vel) < self._stable_velocity_threshold:
+            if abs(vel) < self._calm_velocity_threshold:
                 calm_streak += 1
-                if calm_streak >= 5:
+                if calm_streak >= self._calm_streak_required:
                     start_idx = i + calm_streak
                     break
             else:
@@ -153,8 +160,6 @@ class DailyMonitor:
                 if duration > self.slow_transition_threshold:
                     self.num_slow_transitions += 1
                 print(f"[SIT-TO-STAND] Durata: {duration:.2f}s")
-                if hasattr(self, 'event_buffer') and self.event_buffer:
-                    self.event_buffer.on_sit_to_stand(duration, self.rising_start_time)
                 self._log_event("SIT_TO_STAND_COMPLETE", duration=duration, details={
                     'duration_sec': round(duration, 2),
                     'slow': duration > self.slow_transition_threshold
@@ -184,10 +189,7 @@ class DailyMonitor:
             
             # Resetta stato dopo troppi frame senza tracking
             if self._no_tracking_frames > 10:
-                if self._no_tracking_frames == 11 and hasattr(self, 'event_buffer') and self.event_buffer:
-                    gap = self._no_tracking_frames / 24.0
-                    self.event_buffer.on_tracking_lost(gap, self.prev_state, 0)
-                self.prev_state = "UNKNOWN"  # dopo averlo usato
+                self.prev_state = "UNKNOWN"
             self.prev_time = current_time
             return
 
@@ -261,8 +263,9 @@ class DailyMonitor:
             
             # Caso 4: in piedi, conta frame stabili con velocità SMOOTHATA
             else:
-                # Media velocità su 5 frame: elimina il jitter (±12 → ~0)
-                # ma mantiene il bias di un'alzata lenta (costantemente negativa → ~-20)
+                # La velocity dal PoseDetector è già su 3 frame (jitter ~±8).
+                # La media su 5 frame qui riduce ulteriormente a ~±2.
+                # Soglia _stable_velocity_threshold=10: fermo passa, alzata lenta (-15/-20) no.
                 n_avg = min(5, len(self.recent_velocities))
                 if n_avg >= 3:
                     avg_vel = sum(v for _, v in list(self.recent_velocities)[-n_avg:]) / n_avg
@@ -357,8 +360,7 @@ class DailyMonitor:
                     'signal_used': gait['signal_used'] if gait else None
                 }
                 self.walking_episodes.append(episode)
-                if hasattr(self, 'event_buffer') and self.event_buffer:
-                    self.event_buffer.on_walking_episode(episode)
+
                 gait_str = ""
                 if gait:
                     gait_str = (f"  Cadenza: {gait['cadence']}p/min"
@@ -401,19 +403,12 @@ class DailyMonitor:
         if new_state == "WALKING" and old_state != "WALKING":
             self.num_walkings += 1
             self._log_event("WALK_START")
-        self._recent_transitions.append((current_time, f"{old_state}->{new_state}"))
-        sit_stand = [(t, tr) for t, tr in self._recent_transitions
-                    if "SITTING" in tr and current_time - t < 30]
-        if len(sit_stand) >= 4 and hasattr(self, 'event_buffer') and self.event_buffer:
-            window = current_time - sit_stand[0][0]
-            self.event_buffer.on_rapid_transitions(len(sit_stand), window)
-            self._recent_transitions.clear()
 
     def get_summary(self):
         """Restituisce il riepilogo da salvare nel DB.
         
-        NOTA: tutti i tempi sono in SECONDI.
-        Le chiavi usano _sec per chiarezza.
+        NOTA: i valori temporali sono in SECONDI nonostante le chiavi dicano _min.
+        Questo per compatibilità con lo schema DB esistente (colonne _min).
         """
         total_time = time.time() - self.start_time
 
