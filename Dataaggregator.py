@@ -781,16 +781,20 @@ def _argmax(values):
 
 
 def _build_trend_entry(label, unit, curr_val, prev_val, higher_is_better):
+    # Converti None in 0 subito
+    curr_val = curr_val if curr_val is not None else 0
+    prev_val = prev_val if prev_val is not None else 0
+
     entry = {
         "label": label,
         "unit": unit,
-        "current": round(curr_val, 2) if curr_val else 0,
-        "previous": round(prev_val, 2) if prev_val else 0,
+        "current": round(curr_val, 2),
+        "previous": round(prev_val, 2),
         "change_pct": 0,
         "interpretation": "stabile"
     }
 
-    if prev_val and prev_val != 0:
+    if prev_val != 0:
         pct = ((curr_val - prev_val) / abs(prev_val)) * 100
         entry["change_pct"] = round(pct, 1)
 

@@ -30,6 +30,7 @@ class DailyMonitor:
         self.num_sit_to_stand = 0
         self.num_stand_to_sit = 0
         self.num_walkings = 0
+        self._recent_transitions = deque(maxlen=10)  
 
         # Sit-to-stand timing
         self.sit_to_stand_times = []
@@ -41,9 +42,19 @@ class DailyMonitor:
         self.knee_angle_increasing = []
         self._prev_knee = 0
         self.rising_frames = 0
-        self.recent_velocities = deque(maxlen=60)  # ~2 secondi
+        # FIX: maxlen limitato a ~3 secondi (ricalcolato quando si conosce il fps)
+        self._velocity_maxlen = 90  # ~3s a 30fps, aggiornato da set_fps se serve
+        self.recent_velocities = deque(maxlen=self._velocity_maxlen)
         self.rising_in_progress = False
+        self.rising_start_time = None  # timestamp di inizio alzata
         self.stable_standing_frames = 0
+        # Soglia velocità SMOOTHATA (media 5 frame):
+        # Jitter da fermo: ±12 instantaneo → media ~0 → STABILE
+        # Alzata lenta: -24 costante → media ~-20 → NON STABILE
+        # Alzata veloce: -100+ → media ~-80 → NON STABILE
+        self._stable_velocity_threshold = 15
+        # Timeout: se il rising dura più di 5s, qualcosa è andato storto
+        self._rising_timeout = 5.0
 
         # Inattività
         self.longest_inactivity = 0
@@ -65,7 +76,7 @@ class DailyMonitor:
         self.events = []
 
         # === ANALISI ANDATURA ===
-        self.gait_analyzer = GaitAnalyzer(fps=10)
+        self.gait_analyzer = GaitAnalyzer(fps=25)
 
         # === TIME SLOT (ogni 30 minuti) ===
         self.slot_duration = 1800  # 30 minuti in secondi
@@ -75,9 +86,12 @@ class DailyMonitor:
         self.slot_walking = 0
         self.slot_sit_to_stand = 0
         self.completed_slots = []
-        #frame
+        # frame
         self._no_tracking_frames = 0
         self._had_tracking_gap = False
+
+        _buf = getattr(self, 'event_buffer', None)
+        self.event_buffer = _buf
 
     def _log_event(self, event_type, duration=None, details=None):
         """Registra un evento con timestamp"""
@@ -107,7 +121,7 @@ class DailyMonitor:
         
         for i in range(peak_idx, -1, -1):
             t, vel = self.recent_velocities[i]
-            if abs(vel) < 2:
+            if abs(vel) < self._stable_velocity_threshold:
                 calm_streak += 1
                 if calm_streak >= 5:
                     start_idx = i + calm_streak
@@ -116,11 +130,45 @@ class DailyMonitor:
                 calm_streak = 0
                 start_idx = i
         
+        # Protezione: start_idx non può superare la lunghezza della deque
+        if start_idx >= len(self.recent_velocities):
+            start_idx = len(self.recent_velocities) - 1
+        
         return self.recent_velocities[start_idx][0]
+
+    def _complete_rising(self, current_time):
+        """Completa il rilevamento dell'alzata e registra la durata."""
+        # Calcola il momento in cui è diventato stabile
+        n_stable = min(self.stable_standing_frames, len(self.recent_velocities))
+        if n_stable >= 2:
+            stable_start_time = self.recent_velocities[-n_stable][0]
+        else:
+            stable_start_time = current_time
+
+        start_time = self._find_rising_start(current_time)
+        if start_time:
+            duration = stable_start_time - start_time
+            if duration > 0.3:  # ignora misurazioni troppo corte
+                self.sit_to_stand_times.append(duration)
+                if duration > self.slow_transition_threshold:
+                    self.num_slow_transitions += 1
+                print(f"[SIT-TO-STAND] Durata: {duration:.2f}s")
+                if hasattr(self, 'event_buffer') and self.event_buffer:
+                    self.event_buffer.on_sit_to_stand(duration, self.rising_start_time)
+                self._log_event("SIT_TO_STAND_COMPLETE", duration=duration, details={
+                    'duration_sec': round(duration, 2),
+                    'slow': duration > self.slow_transition_threshold
+                })
+
+        self.rising_in_progress = False
+        self.rising_start_time = None
+        self.stable_standing_frames = 0
+        self.recent_velocities.clear()
+
     def update(self, state, movement, pose_detected, hip_y_velocity):
         """Chiamata ogni frame"""
         current_time = time.time()
-        dt = current_time - self.prev_time
+        dt = min(current_time - self.prev_time, 1.0)  # max 1 secondo per frame
 
         self.frames_total += 1
         if pose_detected:
@@ -132,11 +180,14 @@ class DailyMonitor:
             
             # Chiudi episodio di cammino se era aperto
             if self._no_tracking_frames > 5 and self.current_walk_start is not None:
-                self.track_walking("STANDING", None, None, None, 0, 0, None, None,None,None)
+                self.track_walking("STANDING", None, None, None, 0, 0, None, None, None, None, fps=None)
             
             # Resetta stato dopo troppi frame senza tracking
             if self._no_tracking_frames > 10:
-                self.prev_state = "UNKNOWN"
+                if self._no_tracking_frames == 11 and hasattr(self, 'event_buffer') and self.event_buffer:
+                    gap = self._no_tracking_frames / 24.0
+                    self.event_buffer.on_tracking_lost(gap, self.prev_state, 0)
+                self.prev_state = "UNKNOWN"  # dopo averlo usato
             self.prev_time = current_time
             return
 
@@ -187,39 +238,51 @@ class DailyMonitor:
 
         # === ALZATA ===
         self.recent_velocities.append((current_time, hip_y_velocity))
+
         if self.prev_state == "SITTING" and state in ("STANDING", "WALKING") and not self.rising_in_progress:
             self.rising_in_progress = True
+            self.rising_start_time = current_time
             self.stable_standing_frames = 0
 
         if self.rising_in_progress:
+            # Caso 1: torna a SITTING → alzata fallita
             if state == "SITTING":
                 self.rising_in_progress = False
                 self.stable_standing_frames = 0
-            elif abs(hip_y_velocity) < 2:
-                self.stable_standing_frames += 1
-            else:
-                self.stable_standing_frames = 0
-
-            if self.stable_standing_frames >= 5:
-                stable_start_time = self.recent_velocities[-5][0] if len(self.recent_velocities) >= 5 else current_time
-                start_time = self._find_rising_start(current_time)
-                if start_time:
-                    duration = stable_start_time - start_time
-                    if duration > 0.3:  # ignora misurazioni troppo corte
-                        self.sit_to_stand_times.append(duration)
-                        if duration > self.slow_transition_threshold:
-                            self.num_slow_transitions += 1
-                        print(f"[SIT-TO-STAND] Durata: {duration:.2f}s")
-                        self._log_event("SIT_TO_STAND_COMPLETE", duration=duration, details={
-                            'duration_sec': round(duration, 2),
-                            'slow': duration > self.slow_transition_threshold
-                        })
-                self.rising_in_progress = False
-                self.stable_standing_frames = 0
                 self.recent_velocities.clear()
+            
+            # Caso 2: sta camminando → si è chiaramente alzato, completa subito
+            elif state == "WALKING":
+                self._complete_rising(current_time)
+            
+            # Caso 3: timeout → troppo tempo, completa con quello che abbiamo
+            elif current_time - self.rising_start_time > self._rising_timeout:
+                self._complete_rising(current_time)
+            
+            # Caso 4: in piedi, conta frame stabili con velocità SMOOTHATA
+            else:
+                # Media velocità su 5 frame: elimina il jitter (±12 → ~0)
+                # ma mantiene il bias di un'alzata lenta (costantemente negativa → ~-20)
+                n_avg = min(5, len(self.recent_velocities))
+                if n_avg >= 3:
+                    avg_vel = sum(v for _, v in list(self.recent_velocities)[-n_avg:]) / n_avg
+                else:
+                    avg_vel = hip_y_velocity
 
-        # Traccia inattività
-        if movement > 2:
+                if abs(avg_vel) < self._stable_velocity_threshold:
+                    self.stable_standing_frames += 1
+                else:
+                    self.stable_standing_frames = 0
+
+                if self.stable_standing_frames >= 8:
+                    self._complete_rising(current_time)
+                
+                # DEBUG alzata
+                if self.rising_in_progress:
+                    print(f"[RISING] vel={hip_y_velocity:.1f} avg={avg_vel:.1f} stable={self.stable_standing_frames}/8 state={state}")
+
+        # Traccia inattività (soglia adattata alla nuova scala movement)
+        if movement > 25:
             inactivity = current_time - self.current_inactivity_start
             if inactivity > self.longest_inactivity:
                 self.longest_inactivity = inactivity
@@ -229,25 +292,17 @@ class DailyMonitor:
         self.prev_time = current_time
 
     def track_walking(self, state, hip_x, hip_y, pixels_per_meter,
-                      left_ankle_y, right_ankle_y, left_ankle_x,right_ankle_x, shoulder_mid_x, shoulder_mid_y):
+                      left_ankle_y, right_ankle_y, left_ankle_x, right_ankle_x,
+                      shoulder_mid_x, shoulder_mid_y, fps):
         """Tracking episodi di cammino + analisi andatura."""
         current_time = time.time()
         dt = current_time - self.prev_time if self.prev_time else 0
-        # --- Calcolo FPS reale stabile ---
-        if not hasattr(self, '_fps_frame_count'):
-            self._fps_frame_count = 0
-            self._fps_start_time = current_time
-
-        self._fps_frame_count += 1
-        if self._fps_frame_count % 50 == 0:
-            elapsed = current_time - self._fps_start_time
-            if elapsed > 0:
-                avg_fps = self._fps_frame_count / elapsed
-                self.gait_analyzer.set_fps(avg_fps)
-
+        if fps is not None:
+            self.gait_analyzer.set_fps(fps)
         if state == "WALKING":
             # Inizio nuovo episodio
             if self.current_walk_start is None:
+                print(f"[WALK START] Inizio episodio con fps={self.gait_analyzer.fps:.1f}")
                 self.current_walk_start = current_time
                 self.current_walk_distance_px = 0
                 self.current_walk_speeds = []
@@ -260,7 +315,7 @@ class DailyMonitor:
                 dx = hip_x - self.prev_hip_x
                 dy = hip_y - self.prev_hip_y
                 step_px = math.sqrt(dx**2 + dy**2)
-                if step_px < 50:  # filtra salti tracking
+                if dt > 0 and step_px / dt < 1500:  # max 1500 px/s, sennò è un salto tracking
                     self.current_walk_distance_px += step_px
 
                     # Velocità istantanea
@@ -268,12 +323,12 @@ class DailyMonitor:
                         speed = (step_px / pixels_per_meter) / dt
                         if speed < 5:  # filtra valori assurdi
                             self.current_walk_speeds.append(speed)
-            
 
             # Alimenta il GaitAnalyzer con le posizioni delle caviglie
             if left_ankle_y is not None and right_ankle_y is not None:
-                #print(f"[DEBUG] Ankles Y: L={left_ankle_y:.1f}, R={right_ankle_y:.1f}")
-                self.gait_analyzer.update(left_ankle_y, right_ankle_y, current_time,hip_x,hip_y, left_ankle_x,right_ankle_x, shoulder_mid_x, shoulder_mid_y)
+                self.gait_analyzer.update(left_ankle_y, right_ankle_y, current_time,
+                                          hip_x, hip_y, left_ankle_x, right_ankle_x,
+                                          shoulder_mid_x, shoulder_mid_y)
 
             self.prev_hip_x = hip_x
             self.prev_hip_y = hip_y
@@ -287,7 +342,6 @@ class DailyMonitor:
 
                 # Analisi andatura
                 gait = self.gait_analyzer.stop()
-                #print(f"[GAIT DEBUG] frames: {self.gait_analyzer.frame_count}, result: {gait}")
                 episode = {
                     'date': self.date,
                     'start_time': datetime.fromtimestamp(self.current_walk_start).isoformat(),
@@ -303,10 +357,11 @@ class DailyMonitor:
                     'signal_used': gait['signal_used'] if gait else None
                 }
                 self.walking_episodes.append(episode)
-
+                if hasattr(self, 'event_buffer') and self.event_buffer:
+                    self.event_buffer.on_walking_episode(episode)
                 gait_str = ""
                 if gait:
-                   gait_str = ( f"  Cadenza: {gait['cadence']}p/min"
+                    gait_str = (f"  Cadenza: {gait['cadence']}p/min"
                                 f"  Simm: {gait['symmetry']}%"
                                 f"  Reg: {gait['regularity']}%"
                                 f"  Passi: {gait['total_steps']}"
@@ -346,9 +401,20 @@ class DailyMonitor:
         if new_state == "WALKING" and old_state != "WALKING":
             self.num_walkings += 1
             self._log_event("WALK_START")
+        self._recent_transitions.append((current_time, f"{old_state}->{new_state}"))
+        sit_stand = [(t, tr) for t, tr in self._recent_transitions
+                    if "SITTING" in tr and current_time - t < 30]
+        if len(sit_stand) >= 4 and hasattr(self, 'event_buffer') and self.event_buffer:
+            window = current_time - sit_stand[0][0]
+            self.event_buffer.on_rapid_transitions(len(sit_stand), window)
+            self._recent_transitions.clear()
 
     def get_summary(self):
-        """Restituisce il riepilogo da salvare nel DB"""
+        """Restituisce il riepilogo da salvare nel DB.
+        
+        NOTA: tutti i tempi sono in SECONDI.
+        Le chiavi usano _sec per chiarezza.
+        """
         total_time = time.time() - self.start_time
 
         avg_sit_to_stand = 0

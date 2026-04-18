@@ -58,10 +58,12 @@ class GaitAnalyzer:
     def stop(self):
         """Ferma la raccolta e restituisce le metriche."""
         self.active = False
-        duration = self.frame_count / self.fps
+        if len(self.timestamps) < 2:
+            return None
+        duration = self.timestamps[-1] - self.timestamps[0]
         if duration < self.MIN_DURATION_SEC:
             return None
-        return self.analyze()
+        return self.analyze(duration)
 
     def update(self, left_ankle_y, right_ankle_y, timestamp=None,
                hip_x=None, hip_y=None,
@@ -102,7 +104,7 @@ class GaitAnalyzer:
     # =========================================
     # ANALISI: SELEZIONE AUTOMATICA SEGNALE
     # =========================================
-    def analyze(self):
+    def analyze(self, duration_sec):
         """
         Prova i tre segnali in ordine di priorita':
         1. Caviglie Y (separa dx/sx, il piu' informativo)
@@ -112,18 +114,18 @@ class GaitAnalyzer:
         if len(self.left_ankle_y) < self.fps:
             return None
 
-        result = self._try_ankle_y()
+        result = self._try_ankle_y(duration_sec)
         if result is None:
-            result = self._try_inter_ankle_distance()
+            result = self._try_inter_ankle_distance(duration_sec)
         if result is None:
-            result = self._try_hip_y()
+            result = self._try_hip_y(duration_sec)
 
         return result
 
     # =========================================
     # SEGNALE 1: CAVIGLIE Y (vista laterale)
     # =========================================
-    def _try_ankle_y(self):
+    def _try_ankle_y(self, duration_sec):
         """
         Massimi locali nella Y delle caviglie.
         Funziona con vista laterale. Separa dx/sx.
@@ -151,8 +153,6 @@ class GaitAnalyzer:
 
         if len(left_steps) < 2 and len(right_steps) < 2:
             return None
-
-        duration_sec = len(left_smooth) / self.fps
         self.signal_used = "ankle_y"
 
         return self._build_result_bilateral(
@@ -164,7 +164,7 @@ class GaitAnalyzer:
     # =========================================
     # SEGNALE 2: DISTANZA INTER-CAVIGLIA
     # =========================================
-    def _try_inter_ankle_distance(self):
+    def _try_inter_ankle_distance(self, duration_sec):
         """
         Distanza euclidea tra caviglia sx e dx.
         Oscilla ad ogni passo da qualsiasi angolazione.
@@ -195,7 +195,6 @@ class GaitAnalyzer:
         if len(steps) < 4:
             return None
 
-        duration_sec = len(smooth) / self.fps
         self.signal_used = "inter_ankle_distance"
 
         return self._build_result_unified(smooth, steps, duration_sec)
@@ -203,7 +202,7 @@ class GaitAnalyzer:
     # =========================================
     # SEGNALE 3: HIP Y (fallback universale)
     # =========================================
-    def _try_hip_y(self):
+    def _try_hip_y(self,duration_sec):
         """
         Oscillazione verticale dell'anca (2-4 cm per passo).
         Visibile da qualsiasi angolazione.
@@ -226,7 +225,6 @@ class GaitAnalyzer:
         if len(steps) < 4:
             return None
 
-        duration_sec = len(smooth) / self.fps
         self.signal_used = "hip_y"
 
         return self._build_result_unified(smooth, steps, duration_sec)
@@ -654,9 +652,10 @@ class GaitAnalyzer:
         # Intervalli tra passi consecutivi
         raw_intervals = []
         for i in range(1, len(all_steps)):
-            dt = (all_steps[i][0] - all_steps[i-1][0]) / self.fps
+            idx_prev = all_steps[i-1][0]
+            idx_curr = all_steps[i][0]
+            dt = self.timestamps[idx_curr] - self.timestamps[idx_prev]
             raw_intervals.append(dt)
-
         # Filtra: un passo non puo' durare meno di 0.25s ne' piu' di 1.5s
         # A 8fps, 0.25s = 2 frame (sotto e' rumore)
         # 1.5s = pausa tra passi, non un passo
@@ -675,7 +674,9 @@ class GaitAnalyzer:
     def _step_intervals(self, steps):
         if len(steps) < 2:
             return []
-        return [(steps[i] - steps[i-1]) / self.fps for i in range(1, len(steps))]
+        # Usa i timestamp reali invece di dividere per fps
+        return [self.timestamps[steps[i]] - self.timestamps[steps[i-1]] 
+                for i in range(1, len(steps))]
 
     def set_fps(self, fps):
         self.fps = fps

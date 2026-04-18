@@ -10,9 +10,10 @@ from TugTest import TUGTest
 from SitToStandTest import SitToStandTest
 from Daily_monitor import DailyMonitor
 from Database_manager import DatabaseManager
-from Contextanalyzer import ContextAnalyzer
 from Dataaggregator import DataAggregator
 from c500 import CameraController
+from collections import deque
+from EventFrameBuffer import EventFrameBuffer
 
 class MonitoringSystem:
     def __init__(self, monitor_index=1, display_width=1280):
@@ -26,7 +27,8 @@ class MonitoringSystem:
 
         # Telecamera
         self.cam_ctrl = CameraController()
-        self.monitor = {"top": 200, "left": 88, "width": 800, "height": 600}  # Monitor 1: area di interesse (da calibrare)
+        
+        self.monitor = {"top": 130, "left": 100, "width": 870, "height": 520}  # Monitor 1: area di interesse (da calibrare)
         self.frame_width = self.monitor["width"]
         self.frame_height = self.monitor["height"]
         
@@ -54,8 +56,9 @@ class MonitoringSystem:
 
        
         # Recupera la chiave
-        self.context = ContextAnalyzer(model="gemma4:e2b")
-
+        
+        self.event_buffer = EventFrameBuffer(model="gemma4:e2b")  # Buffer per eventi contestuali
+        self.daily_monitor.event_buffer = self.event_buffer
         # Calcola dimensioni display
         self.needs_resize = self.frame_width > self.display_width
         if self.needs_resize:
@@ -70,27 +73,27 @@ class MonitoringSystem:
         print(f"Modalità: Screen capture (monitor {monitor_index})")
 
     def run(self):
-         # Finestra monitoring: metà destra, in alto
         cv2.namedWindow("Monitoring", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("Monitoring", self.monitor["width"], self.monitor["height"] // 2)
         cv2.moveWindow("Monitoring", self.monitor["width"], 0)
+
+        # Inizializza contatore FPS una sola volta
+        self._frame_times = deque(maxlen=60)
+        self._last_fps_print = 0
+
         while True:
-            # Cattura schermo con mss
+            # Cattura schermo
             sct_img = self.sct.grab(self.monitor)
             frame = np.array(sct_img)
             frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
 
-            # Ridimensiona
             if self.needs_resize:
                 frame = cv2.resize(frame, (self.display_width, self.display_height))
 
             # MediaPipe
             frame = self.detector.findPose(frame, draw=True)
             lmList = self.detector.findPosition(frame, draw=False)
-            if self.detector.tracking_quality < 0.6:
-                pose_detected = False
-            else:
-                pose_detected = len(lmList) > 0
+            pose_detected = (self.detector.tracking_quality >= 0.75) and (len(lmList) > 0)
 
             if pose_detected:
                 state = self.detector.detect_posture(self.current_test)
@@ -100,12 +103,8 @@ class MonitoringSystem:
                 self.detector.findAngle(frame, 24, 26, 28, draw=True, filtered=False)
                 self.detector.findAngle(frame, 23, 25, 27, draw=True, filtered=False)
 
-                # Update daily monitor
                 self.daily_monitor.update(state, movement, pose_detected, self.detector.hip_y_velocity)
 
-                # Tracking episodi di cammino (metodo separato, parametri obbligatori)
-                # Recupera posizione Y caviglie per analisi andatura
-              
                 self.daily_monitor.track_walking(
                     state,
                     self.detector.hip_x,
@@ -115,61 +114,58 @@ class MonitoringSystem:
                     self.detector.right_ankle_y,
                     self.detector.left_ankle_x,
                     self.detector.right_ankle_x,
-                    self.detector.shoulder_mid_x, 
-                    self.detector.shoulder_mid_y
+                    self.detector.shoulder_mid_x,
+                    self.detector.shoulder_mid_y,
+                    fps=self.detector.fps
                 )
-                # === TRIGGER ADATTIVI LLM ===
-                should, reason = self.context.should_trigger(context)
-                if should:
-                    snapshot = self.context.trigger(frame, context, reason)
-                    if snapshot:
-                        self._save_snapshot(snapshot)
+
+                # Context UNA VOLTA
+                context = self._build_vlm_context(state)
+
+                
+
                 self._update_tests(state, knee_angle, movement, frame)
 
+                # Overlay
                 cv2.putText(frame, f"Stato: {state}", (10, 80),
                             cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
                 cv2.putText(frame, f"Mov: {movement:.1f}  VelY: {self.detector.hip_y_velocity:.1f}",
                             (10, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
                 cv2.putText(frame, f"Steps: {self.detector.step_activity:.1f}",
                             (10, 230), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-                #rising = self.daily_monitor.rising_in_progress
-                #stable = self.daily_monitor.stable_standing_frames
-                #sts_count = len(self.daily_monitor.sit_to_stand_times)
-                #last_sts = f"{self.daily_monitor.sit_to_stand_times[-1]:.1f}s" if self.daily_monitor.sit_to_stand_times else "-"
-                #cv2.putText(frame, f"Rising: {rising}  Stable: {stable}  STS: {sts_count} ({last_sts})",
-                  #          (10, 260), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 200), 2)
-                #cv2.putText(frame, f"Knee: {knee_angle:.0f}  VelY: {self.detector.hip_y_velocity:.1f}",
-                        #    (10, 290), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 200), 2)
-                
-                # Mostra velocità in m/s se calibrato
+
                 speed_ms = self.detector.get_speed_ms()
                 if speed_ms is not None:
                     cv2.putText(frame, f"Speed: {speed_ms:.2f} m/s",
                                 (10, 160), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
             else:
                 self.daily_monitor.update("UNKNOWN", 0, False, 0)
-
-            # === ANALISI CONTESTUALE (Vision LLM) ===
-            # Periodico
-            if pose_detected:
-                context = self._build_vlm_context(state)
-            else:
                 context = {'state': 'UNKNOWN', 'state_duration_sec': 0}
-            snapshot = self.context.update(frame, context)
-            if snapshot:
-                self._save_snapshot(snapshot)
+            self.event_buffer.update(frame, context)
+            # Raccogli risultati VLM completati
+            for result in self.event_buffer.get_results():
+                self._save_event_snapshot(result)
+          
 
             self._draw_overlay(frame)
             self.current_frame = frame
             cv2.imshow("Monitoring", frame)
-            # FPS reale
-            if not hasattr(self, '_fps_counter'):
-                self._fps_counter = 0
-                self._fps_start = time.time()
-            self._fps_counter += 1
-            if self._fps_counter % 100 == 0:
-                real_fps = self._fps_counter / (time.time() - self._fps_start)
-                print(f"[FPS] {real_fps:.1f}")
+
+            # FPS rolling
+            now = time.time()
+            self._frame_times.append(now)
+            if len(self._frame_times) >= 30:
+                span = self._frame_times[-1] - self._frame_times[0]
+                if span > 0:
+                    real_fps = (len(self._frame_times) - 1) / span
+                    self.detector.set_fps(real_fps)
+                    self.daily_monitor.gait_analyzer.set_fps(real_fps)
+
+                    if now - self._last_fps_print > 5:
+                        print(f"[FPS] {real_fps:.1f}")
+                        self._last_fps_print = now
+
+            # Input tastiera OGNI frame
             key = cv2.waitKeyEx(1)
             self._handle_input(key)
 
@@ -290,17 +286,8 @@ class MonitoringSystem:
         self.current_test = None
         self.current_test_id = None
 
-    def _save_snapshot(self, snapshot):
-        """Salva uno snapshot contestuale nel DB."""
-        snapshot_data = {
-        'date': self.daily_monitor.date,
-        'timestamp': snapshot.get('timestamp'),
-        'description': snapshot.get('description'),
-        'parsed_json': json.dumps(snapshot.get('structured')) if snapshot.get('structured') else None,
-        'context_json': json.dumps(snapshot.get('context')) if snapshot.get('context') else None,
-        'state': snapshot.get('context', {}).get('state') if snapshot.get('context') else None
-        }
-        self.db.save_context_snapshot(snapshot_data)
+   
+       
 
     def _shutdown(self):
         # ── 1. Salva tutti i dati giornalieri nel DB ──
@@ -323,14 +310,10 @@ class MonitoringSystem:
         for slot in self.daily_monitor.completed_slots:
             self.db.save_time_slot(slot)
         print(f"Salvati {len(self.daily_monitor.completed_slots)} slot temporali")
-
-        # Salva snapshot contestuali non ancora salvati (periodici)
-        for snap in self.context.get_snapshots():
-            snap['date'] = self.daily_monitor.date
-            # Evita duplicati (quelli già salvati in tempo reale)
-            if 'saved' not in snap:
-                self.db.save_context_snapshot(snap)
-        print(f"Totale snapshot contestuali: {len(self.context.get_snapshots())}")
+        
+        for result in self.event_buffer.get_all_results():
+            self._save_event_snapshot(result)
+       
 
         # ── 2. Aggregazione e analisi trend ──
         print("\n" + "=" * 50)
@@ -345,9 +328,9 @@ class MonitoringSystem:
             avg = weekly["daily_averages"]
             print(f"\n--- Settimana ({weekly['period_start']} → {weekly['period_end']}) ---")
             print(f"  Giorni monitorati: {weekly['days_monitored']}")
-            print(f"  Cammino medio/giorno: {avg.get('avg_time_walking_min', 0):.1f} min")
-            print(f"  Alzate medie/giorno:  {avg.get('avg_num_sit_to_stand', 0):.1f}")
-            print(f"  Indipendenza media:   {avg.get('avg_independence_score', 0):.0f}%")
+            print(f"  Cammino medio/giorno: {avg.get('avg_time_walking_min') or 0:.1f} min")
+            print(f"  Alzate medie/giorno:  {avg.get('avg_num_sit_to_stand') or 0:.1f}")
+            print(f"  Indipendenza media:   {avg.get('avg_independence_score') or 0:.0f}%")
 
             gait = weekly.get("gait", {})
             if gait.get("avg_speed_ms"):
@@ -381,7 +364,17 @@ class MonitoringSystem:
 
         cv2.destroyAllWindows()
         print("Sistema chiuso, dati salvati.")
-
+    def _save_event_snapshot(self, result):
+        """Salva un risultato dell'analisi VLM evento nel DB."""
+        snapshot_data = {
+            'date': self.daily_monitor.date,
+            'timestamp': result.get('timestamp'),
+            'description': result.get('description'),
+            'parsed_json': None,
+            'context_json': json.dumps(result.get('context')) if result.get('context') else None,
+            'state': result.get('context', {}).get('event', 'event_analysis')
+        }
+        self.db.save_context_snapshot(snapshot_data)
 
 if __name__ == "__main__":
     system = MonitoringSystem(
