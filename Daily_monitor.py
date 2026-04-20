@@ -100,6 +100,7 @@ class DailyMonitor:
         # frame
         self._no_tracking_frames = 0
         self._had_tracking_gap = False
+        self._last_tracking_lost_vlm = 0  # cooldown per tracking_lost VLM
 
     def _log_event(self, event_type, duration=None, details=None):
         """Registra un evento con timestamp"""
@@ -196,7 +197,8 @@ class DailyMonitor:
             self._no_tracking_frames += 1
             
             # Salva lo stato prima che venga sovrascritto con UNKNOWN
-            if self._no_tracking_frames == 1:
+            # Solo se era uno stato reale (non UNKNOWN da un gap precedente)
+            if self._no_tracking_frames == 1 and self.prev_state != "UNKNOWN":
                 self._last_known_state = self.prev_state
             
             # Chiudi episodio di cammino se era aperto
@@ -205,10 +207,17 @@ class DailyMonitor:
             
             # Resetta stato dopo troppi frame senza tracking
             if self._no_tracking_frames > 10:
-                # Trigger VLM solo dopo 5 secondi (~120 frame) di tracking perso
-                if self._no_tracking_frames == 120 and hasattr(self, 'event_buffer') and self.event_buffer:
+                # Trigger VLM solo se:
+                # 1. Tracking perso da 5+ secondi (~120 frame)
+                # 2. C'era qualcuno prima (last_known_state != UNKNOWN)
+                # 3. Cooldown di 5 minuti rispettato
+                if (self._no_tracking_frames == 120
+                    and self._last_known_state != "UNKNOWN"
+                    and hasattr(self, 'event_buffer') and self.event_buffer
+                    and current_time - self._last_tracking_lost_vlm > 300):
                     gap = self._no_tracking_frames / 24.0
                     self.event_buffer.on_tracking_lost(gap, self._last_known_state, 0)
+                    self._last_tracking_lost_vlm = current_time
                 self.prev_state = "UNKNOWN"
                 # FIX: pulisci il rilevamento alzata — i dati vecchi non sono più validi
                 self.recent_velocities.clear()

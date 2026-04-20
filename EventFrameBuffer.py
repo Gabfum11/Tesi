@@ -20,8 +20,9 @@ from datetime import datetime
 
 
 class EventFrameBuffer:
-    def __init__(self, model="gemma4:e2b", ollama_url="http://localhost:11434",
-                 buffer_seconds=30, capture_fps=2, max_frames_per_request=6):
+    def __init__(self, model="qwen2.5vl:7b", ollama_url="http://localhost:11434",
+                 buffer_seconds=30, capture_fps=2, max_frames_per_request=5,
+                 frame_max_size=512):
         """
         Args:
             model: modello Ollama con supporto vision
@@ -29,11 +30,13 @@ class EventFrameBuffer:
             buffer_seconds: quanti secondi di frame mantenere
             capture_fps: frame catturati al secondo (non serve più di 2)
             max_frames_per_request: max frame inviati a Ollama per evento
+            frame_max_size: lato massimo in pixel per le immagini inviate a Ollama
         """
         self.model = model
         self.ollama_url = ollama_url
         self.capture_fps = capture_fps
         self.max_frames = max_frames_per_request
+        self.frame_max_size = frame_max_size
 
         # Buffer circolare: (timestamp, frame_jpg_bytes)
         buffer_size = buffer_seconds * capture_fps
@@ -67,7 +70,14 @@ class EventFrameBuffer:
         
         # Cattura frame a frequenza ridotta
         if now - self._last_capture_time >= self._capture_interval:
-            _, jpg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            # Ridimensiona per ridurre il peso (800x600 → 512x384)
+            h, w = frame.shape[:2]
+            if max(h, w) > self.frame_max_size:
+                scale = self.frame_max_size / max(h, w)
+                small = cv2.resize(frame, (int(w * scale), int(h * scale)))
+            else:
+                small = frame
+            _, jpg = cv2.imencode('.jpg', small, [cv2.IMWRITE_JPEG_QUALITY, 60])
             self._buffer.append((now, jpg.tobytes()))
             self._last_capture_time = now
 
@@ -114,21 +124,20 @@ class EventFrameBuffer:
                 "model": self.model,
                 "messages": [{
                     "role": "user",
-                    "content": prompt,
+                    "content": prompt + " /no_think",
                     "images": frames_b64
                 }],
                 "stream": False,
-                "think": False,
                 "options": {
                     "temperature": 0.3,
-                    "num_predict": 300
+                    "num_predict": 250
                 }
             }
 
             response = requests.post(
                 f"{self.ollama_url}/api/chat",
                 json=payload,
-                timeout=120  # 32B con multi-image può impiegare fino a 60-90s
+                timeout=60
             )
 
             if response.status_code == 200:
@@ -137,7 +146,18 @@ class EventFrameBuffer:
                 content = msg.get("content", "")
                 thinking = msg.get("thinking", "")
                 
-                # Alcuni modelli mettono la risposta in thinking anche con think:False
+                # Qwen3-VL ignora think:False e mette <think>...</think> nel content
+                if content and "<think>" in content:
+                    import re
+                    # Caso 1: tag chiuso — prendi quello che c'è dopo
+                    cleaned = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+                    if cleaned:
+                        return cleaned
+                    # Caso 2: tag non chiuso — il modello ha esaurito i token nel ragionamento
+                    # Non c'è risposta utile, ritorna None
+                    print(f"[EVENT VLM] Modello ha esaurito i token nel ragionamento, risposta scartata")
+                    return None
+                
                 if content:
                     return content
                 elif thinking:

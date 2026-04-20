@@ -57,7 +57,7 @@ class MonitoringSystem:
        
         # Recupera la chiave
         
-        self.event_buffer = EventFrameBuffer(model="qwen3-vl:8b")  # Buffer per eventi contestuali
+        self.event_buffer = EventFrameBuffer(model="qwen2.5vl:7b")  # Buffer per eventi contestuali
         self.daily_monitor.event_buffer = self.event_buffer
         # Calcola dimensioni display
         self.needs_resize = self.frame_width > self.display_width
