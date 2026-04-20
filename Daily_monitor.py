@@ -72,6 +72,7 @@ class DailyMonitor:
 
         # Stato precedente
         self.prev_state = "SITTING"
+        self._last_known_state = "SITTING"
         self.prev_time = time.time()
 
         # === EPISODI DI CAMMINO ===
@@ -155,11 +156,22 @@ class DailyMonitor:
         start_time = self._find_rising_start(current_time)
         if start_time:
             duration = stable_start_time - start_time
+            # Sanity check: un'alzata reale non dura più di 10 secondi
+            # Se supera, i dati sono corrotti (gap di tracking, velocities vecchie)
+            if duration > 10.0:
+                print(f"[SIT-TO-STAND] Durata anomala ({duration:.1f}s), scartata")
+                self.rising_in_progress = False
+                self.rising_start_time = None
+                self.stable_standing_frames = 0
+                self.recent_velocities.clear()
+                return
             if duration > 0.3:  # ignora misurazioni troppo corte
                 self.sit_to_stand_times.append(duration)
                 if duration > self.slow_transition_threshold:
                     self.num_slow_transitions += 1
                 print(f"[SIT-TO-STAND] Durata: {duration:.2f}s")
+                if hasattr(self, 'event_buffer') and self.event_buffer:
+                    self.event_buffer.on_sit_to_stand(duration, self.rising_start_time)
                 self._log_event("SIT_TO_STAND_COMPLETE", duration=duration, details={
                     'duration_sec': round(duration, 2),
                     'slow': duration > self.slow_transition_threshold
@@ -183,13 +195,25 @@ class DailyMonitor:
         if not pose_detected:
             self._no_tracking_frames += 1
             
+            # Salva lo stato prima che venga sovrascritto con UNKNOWN
+            if self._no_tracking_frames == 1:
+                self._last_known_state = self.prev_state
+            
             # Chiudi episodio di cammino se era aperto
             if self._no_tracking_frames > 5 and self.current_walk_start is not None:
                 self.track_walking("STANDING", None, None, None, 0, 0, None, None, None, None, fps=None)
             
             # Resetta stato dopo troppi frame senza tracking
             if self._no_tracking_frames > 10:
+                # Trigger VLM solo dopo 5 secondi (~120 frame) di tracking perso
+                if self._no_tracking_frames == 120 and hasattr(self, 'event_buffer') and self.event_buffer:
+                    gap = self._no_tracking_frames / 24.0
+                    self.event_buffer.on_tracking_lost(gap, self._last_known_state, 0)
                 self.prev_state = "UNKNOWN"
+                # FIX: pulisci il rilevamento alzata — i dati vecchi non sono più validi
+                self.recent_velocities.clear()
+                self.rising_in_progress = False
+                self.stable_standing_frames = 0
             self.prev_time = current_time
             return
 

@@ -5,12 +5,14 @@ Fornisce riepiloghi settimanali, mensili e annuali a partire dai dati
 giornalieri salvati nel database. Rileva trend, genera alert e calcola
 variazioni rispetto ai periodi precedenti.
 
+NOTA: gli episodi di cammino con reliability_score < 50 vengono
+esclusi dalle aggregazioni cliniche. Restano salvati nel DB per
+eventuali analisi future.
+
 Uso:
     from DataAggregator import DataAggregator
     aggregator = DataAggregator(db_path="monitoring.db")
     weekly = aggregator.get_weekly_summary("2026-03-30")
-    monthly = aggregator.get_monthly_summary(2026, 3)
-    yearly = aggregator.get_yearly_summary(2026)
     trend = aggregator.get_trend_analysis("2026-03-30")
 """
 
@@ -19,13 +21,17 @@ import statistics
 from datetime import date, datetime, timedelta
 from collections import defaultdict
 
+# Soglia minima di affidabilità per includere un episodio di cammino
+# nelle aggregazioni cliniche. Gli episodi sotto questa soglia vengono
+# salvati nel DB ma esclusi da medie, trend e alert.
+MIN_RELIABILITY_SCORE = 50
+
 
 class DataAggregator:
 
     def __init__(self, db_path="monitoring.db"):
         self.db_path = db_path
 
-    # ─── connessione ───────────────────────────────────────────────
     def _connect(self):
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
@@ -35,47 +41,22 @@ class DataAggregator:
     #  RIEPILOGO SETTIMANALE
     # ================================================================
     def get_weekly_summary(self, reference_date=None):
-        """
-        Riepilogo della settimana che contiene reference_date.
-        Se None usa oggi. La settimana va da lunedì a domenica.
-
-        Ritorna dict con:
-          - period_start / period_end
-          - days_monitored (quanti giorni con dati)
-          - totals: tempi cumulativi, transizioni, episodi
-          - daily_averages: medie giornaliere
-          - ranges: min/max giornalieri
-          - gait: metriche andatura aggregate
-          - alerts: lista di segnalazioni
-        """
         ref = _parse_date(reference_date)
         monday = ref - timedelta(days=ref.weekday())
         sunday = monday + timedelta(days=6)
-
-        return self._aggregate_period(
-            start=monday,
-            end=sunday,
-            period_label="weekly"
-        )
+        return self._aggregate_period(start=monday, end=sunday, period_label="weekly")
 
     # ================================================================
     #  RIEPILOGO MENSILE
     # ================================================================
     def get_monthly_summary(self, year, month):
-        """Riepilogo di un mese intero."""
         first_day = date(year, month, 1)
         if month == 12:
             last_day = date(year + 1, 1, 1) - timedelta(days=1)
         else:
             last_day = date(year, month + 1, 1) - timedelta(days=1)
 
-        summary = self._aggregate_period(
-            start=first_day,
-            end=last_day,
-            period_label="monthly"
-        )
-
-        # Aggiungi breakdown settimanale
+        summary = self._aggregate_period(start=first_day, end=last_day, period_label="monthly")
         summary["weekly_breakdown"] = self._weekly_breakdown(first_day, last_day)
         return summary
 
@@ -83,17 +64,11 @@ class DataAggregator:
     #  RIEPILOGO ANNUALE
     # ================================================================
     def get_yearly_summary(self, year):
-        """Riepilogo di un anno intero con breakdown mensile."""
         first_day = date(year, 1, 1)
         last_day = date(year, 12, 31)
 
-        summary = self._aggregate_period(
-            start=first_day,
-            end=last_day,
-            period_label="yearly"
-        )
+        summary = self._aggregate_period(start=first_day, end=last_day, period_label="yearly")
 
-        # Breakdown per mese
         monthly = []
         for m in range(1, 13):
             m_start = date(year, m, 1)
@@ -110,20 +85,12 @@ class DataAggregator:
         return summary
 
     # ================================================================
-    #  ANALISI TREND (confronto con periodo precedente)
+    #  ANALISI TREND
     # ================================================================
     def get_trend_analysis(self, reference_date=None, period="week"):
-        """
-        Confronta il periodo corrente con quello precedente.
-        period: "week" o "month"
-
-        Ritorna dict con variazione % per ogni metrica chiave
-        e un campo 'interpretation' per ognuna.
-        """
         ref = _parse_date(reference_date)
 
         if period == "week":
-            # Settimana corrente vs precedente
             monday_curr = ref - timedelta(days=ref.weekday())
             sunday_curr = monday_curr + timedelta(days=6)
             monday_prev = monday_curr - timedelta(days=7)
@@ -134,7 +101,6 @@ class DataAggregator:
                 last_curr = date(ref.year + 1, 1, 1) - timedelta(days=1)
             else:
                 last_curr = date(ref.year, ref.month + 1, 1) - timedelta(days=1)
-
             if ref.month == 1:
                 first_prev = date(ref.year - 1, 12, 1)
                 last_prev = date(ref.year - 1, 12, 31)
@@ -157,7 +123,6 @@ class DataAggregator:
                 "message": "Dati insufficienti per il confronto trend."
             }
 
-        # Metriche da confrontare (chiave, label, unità, higher_is_better)
         metrics = [
             ("avg_time_walking_min", "Tempo cammino/giorno", "min", True),
             ("avg_time_sitting_min", "Tempo seduto/giorno", "min", False),
@@ -168,10 +133,9 @@ class DataAggregator:
             ("avg_longest_inactivity_min", "Inattività massima/giorno", "min", False),
         ]
 
-        # Metriche gait
         gait_metrics = [
             ("avg_speed_ms", "Velocità cammino", "m/s", True),
-            ("avg_cadence", "Cadenza", "passi/min", None),  # None = dipende
+            ("avg_cadence", "Cadenza", "passi/min", None),
             ("avg_symmetry", "Simmetria passo", "%", True),
             ("avg_regularity", "Regolarità passo", "%", True),
         ]
@@ -183,19 +147,14 @@ class DataAggregator:
         for key, label, unit, higher_is_better in metrics:
             curr_val = ca.get(key, 0)
             prev_val = pa.get(key, 0)
-            trends[key] = _build_trend_entry(
-                label, unit, curr_val, prev_val, higher_is_better
-            )
+            trends[key] = _build_trend_entry(label, unit, curr_val, prev_val, higher_is_better)
 
-        # Trend gait
         cg = current.get("gait", {})
         pg = previous.get("gait", {})
         for key, label, unit, higher_is_better in gait_metrics:
             curr_val = cg.get(key, 0) or 0
             prev_val = pg.get(key, 0) or 0
-            trends[key] = _build_trend_entry(
-                label, unit, curr_val, prev_val, higher_is_better
-            )
+            trends[key] = _build_trend_entry(label, unit, curr_val, prev_val, higher_is_better)
 
         return {
             "status": "ok",
@@ -218,14 +177,6 @@ class DataAggregator:
     #  STORICO METRICHE (per grafici)
     # ================================================================
     def get_metric_history(self, metric, days=30, reference_date=None):
-        """
-        Ritorna la serie storica di una metrica giornaliera.
-        Utile per alimentare grafici.
-
-        metric: nome colonna in daily_summary
-                oppure "gait_speed", "gait_cadence", "gait_symmetry",
-                "gait_regularity" per metriche andatura.
-        """
         ref = _parse_date(reference_date)
         start = ref - timedelta(days=days - 1)
 
@@ -241,7 +192,6 @@ class DataAggregator:
 
         if metric in gait_map:
             col = gait_map[metric]
-            # Media pesata per reliability_score (o total_steps come fallback)
             cursor.execute(f"""
                 SELECT summary_date AS date,
                        SUM({col} * COALESCE(reliability_score, total_steps, 1))
@@ -251,9 +201,10 @@ class DataAggregator:
                 FROM walking_episode
                 WHERE summary_date BETWEEN ? AND ?
                   AND {col} IS NOT NULL
+                  AND (reliability_score IS NULL OR reliability_score >= ?)
                 GROUP BY summary_date
                 ORDER BY summary_date
-            """, (start.isoformat(), ref.isoformat()))
+            """, (start.isoformat(), ref.isoformat(), MIN_RELIABILITY_SCORE))
         else:
             cursor.execute(f"""
                 SELECT date, {metric} AS value
@@ -270,26 +221,15 @@ class DataAggregator:
     #  EPISODI CAMMINO AGGREGATI
     # ================================================================
     def get_walking_summary(self, start_date, end_date):
-        """
-        Statistiche aggregate degli episodi di cammino in un periodo.
-        
-        Usa due strategie per compensare episodi corti e rumorosi:
-        
-        1. POOLED: somma tutti i passi e tutta la durata, poi calcola
-           una cadenza unica. Annulla il rumore degli episodi da 4-5 secondi.
-        
-        2. WEIGHTED: media pesata per reliability_score. Episodi con
-           piu' passi e durata maggiore pesano di piu'.
-           Se reliability_score non e' nel DB, usa total_steps come peso.
-        """
         conn = self._connect()
         cursor = conn.cursor()
 
         cursor.execute("""
             SELECT * FROM walking_episode
             WHERE summary_date BETWEEN ? AND ?
+              AND (reliability_score IS NULL OR reliability_score >= ?)
             ORDER BY start_time
-        """, (start_date, end_date))
+        """, (start_date, end_date, MIN_RELIABILITY_SCORE))
 
         episodes = [dict(r) for r in cursor.fetchall()]
         conn.close()
@@ -302,7 +242,6 @@ class DataAggregator:
         speeds = [e["avg_speed_ms"] for e in episodes if e["avg_speed_ms"]]
         steps_list = [e["total_steps"] for e in episodes if e["total_steps"]]
 
-        # === METRICHE POOLED ===
         total_steps = sum(steps_list) if steps_list else 0
         total_duration = sum(durations) if durations else 0
         pooled_cadence = (total_steps / total_duration * 60) if total_duration > 0 and total_steps > 0 else None
@@ -310,8 +249,6 @@ class DataAggregator:
         total_distance = sum(distances) if distances else None
         pooled_speed = (total_distance / total_duration) if total_distance and total_duration > 0 else None
 
-        # === METRICHE WEIGHTED ===
-        # Peso: reliability_score se disponibile, altrimenti total_steps
         has_reliability = "reliability_score" in episodes[0] if episodes else False
 
         def _get_weight(ep):
@@ -337,15 +274,12 @@ class DataAggregator:
             "total_duration_sec": total_duration,
             "total_distance_m": total_distance,
             "total_steps": total_steps,
-            # Pooled (dal totale — il piu' robusto)
             "pooled_cadence": round(pooled_cadence, 1) if pooled_cadence else None,
             "pooled_speed_ms": round(pooled_speed, 3) if pooled_speed else None,
-            # Weighted (media pesata per reliability)
             "avg_cadence": weighted_cadence,
             "avg_speed_ms": weighted_speed,
             "avg_symmetry": weighted_symmetry,
             "avg_regularity": weighted_regularity,
-            # Estremi
             "max_speed_ms": round(max(speeds), 3) if speeds else None,
             "min_speed_ms": round(min(speeds), 3) if speeds else None,
             "longest_walk_sec": max(durations) if durations else None,
@@ -356,7 +290,6 @@ class DataAggregator:
     #  TUG / STS STORICO
     # ================================================================
     def get_test_history(self, test_type, limit=20):
-        """Ritorna gli ultimi N risultati di un test (TUG o STS)."""
         conn = self._connect()
         cursor = conn.cursor()
 
@@ -395,7 +328,6 @@ class DataAggregator:
     #  CONTEXT SNAPSHOT AGGREGATI
     # ================================================================
     def get_context_snapshots(self, start_date, end_date):
-        """Restituisce gli snapshot del ContextAnalyzer in un periodo."""
         conn = self._connect()
         cursor = conn.cursor()
         cursor.execute("""
@@ -412,10 +344,6 @@ class DataAggregator:
     #  DISTRIBUZIONE ORARIA ATTIVITÀ
     # ================================================================
     def get_hourly_distribution(self, target_date):
-        """
-        Distribuzione dell'attività per fasce orarie in un giorno.
-        Usa i time_slot (30 min) raggruppandoli in ore.
-        """
         conn = self._connect()
         cursor = conn.cursor()
         cursor.execute("""
@@ -451,7 +379,7 @@ class DataAggregator:
         ]
 
     # ================================================================
-    #  METODO INTERNO: AGGREGAZIONE PERIODO GENERICO
+    #  AGGREGAZIONE PERIODO GENERICO
     # ================================================================
     def _aggregate_period(self, start, end, period_label="period"):
         conn = self._connect()
@@ -460,7 +388,6 @@ class DataAggregator:
         start_str = start.isoformat()
         end_str = end.isoformat()
 
-        # --- daily_summary ---
         cursor.execute("""
             SELECT * FROM daily_summary
             WHERE date BETWEEN ? AND ?
@@ -468,14 +395,14 @@ class DataAggregator:
         """, (start_str, end_str))
         days = [dict(r) for r in cursor.fetchall()]
 
-        # --- walking_episode ---
+        # Solo episodi affidabili per le aggregazioni cliniche
         cursor.execute("""
             SELECT * FROM walking_episode
             WHERE summary_date BETWEEN ? AND ?
-        """, (start_str, end_str))
+              AND (reliability_score IS NULL OR reliability_score >= ?)
+        """, (start_str, end_str, MIN_RELIABILITY_SCORE))
         walks = [dict(r) for r in cursor.fetchall()]
 
-        # --- sit-to-stand times (from events) ---
         cursor.execute("""
             SELECT duration_sec FROM activity_event
             WHERE summary_date BETWEEN ? AND ?
@@ -501,7 +428,6 @@ class DataAggregator:
                 "alerts": []
             }
 
-        # ─── TOTALI ───
         totals = {
             "total_monitoring_min": sum(d["total_monitoring_min"] or 0 for d in days),
             "time_sitting_min": sum(d["time_sitting_min"] or 0 for d in days),
@@ -513,7 +439,6 @@ class DataAggregator:
             "num_slow_transitions": sum(d["num_slow_transitions"] or 0 for d in days),
         }
 
-        # ─── MEDIE GIORNALIERE ───
         daily_averages = {
             "avg_time_sitting_min": _safe_mean([d["time_sitting_min"] for d in days]),
             "avg_time_standing_min": _safe_mean([d["time_standing_min"] for d in days]),
@@ -531,7 +456,6 @@ class DataAggregator:
             ),
         }
 
-        # ─── MIN / MAX GIORNALIERI ───
         ranges = {}
         for key in ["time_walking_min", "time_sitting_min", "num_sit_to_stand",
                      "independence_score", "longest_inactivity_min"]:
@@ -546,7 +470,6 @@ class DataAggregator:
                                 else days[_argmax(values)]["date"],
                 }
 
-        # ─── ANDATURA (pooled + weighted) ───
         gait = {}
         if walks:
             steps_list = [w["total_steps"] for w in walks if w["total_steps"]]
@@ -557,7 +480,6 @@ class DataAggregator:
             total_steps_all = sum(steps_list) if steps_list else 0
             total_dur = sum(durations_w) if durations_w else 0
 
-            # Peso per media pesata
             has_rel = "reliability_score" in walks[0]
             def _w(ep):
                 if has_rel and ep.get("reliability_score"):
@@ -568,10 +490,8 @@ class DataAggregator:
                 "total_episodes": len(walks),
                 "total_steps": total_steps_all,
                 "total_walk_duration_sec": total_dur,
-                # Pooled (somma passi / somma durata)
                 "pooled_cadence": round(total_steps_all / total_dur * 60, 1) if total_dur > 0 and total_steps_all > 0 else None,
                 "pooled_speed_ms": round(sum(distances_w) / total_dur, 3) if distances_w and total_dur > 0 else None,
-                # Weighted
                 "avg_speed_ms": _weighted_mean(
                     [(w["avg_speed_ms"], _w(w)) for w in walks if w.get("avg_speed_ms")]
                 ),
@@ -584,12 +504,10 @@ class DataAggregator:
                 "avg_regularity": _weighted_mean(
                     [(w["regularity"], _w(w)) for w in walks if w.get("regularity")]
                 ),
-                # Estremi
                 "max_speed_ms": round(max(speeds), 3) if speeds else None,
                 "min_speed_ms": round(min(speeds), 3) if speeds else None,
             }
 
-        # ─── DETTAGLIO SIT-TO-STAND ───
         sts_detail = {}
         if sts_durations:
             sts_detail = {
@@ -617,17 +535,15 @@ class DataAggregator:
         }
 
     # ================================================================
-    #  BREAKDOWN SETTIMANALE (per riepilogo mensile)
+    #  BREAKDOWN SETTIMANALE
     # ================================================================
     def _weekly_breakdown(self, month_start, month_end):
         weeks = []
         current = month_start
-        # Allinea al lunedì
         current = current - timedelta(days=current.weekday())
 
         while current <= month_end:
             week_end = current + timedelta(days=6)
-            # Limita al mese
             effective_start = max(current, month_start)
             effective_end = min(week_end, month_end)
 
@@ -645,16 +561,10 @@ class DataAggregator:
     #  GENERAZIONE ALERT
     # ================================================================
     def _generate_alerts(self, current, previous, trends):
-        """
-        Genera alert basati sul confronto tra periodi
-        e su soglie cliniche note.
-        """
         alerts = []
         ca = current["daily_averages"]
         gait = current.get("gait", {})
         sts = current.get("sit_to_stand_detail", {})
-
-        # --- Soglie cliniche assolute ---
 
         avg_speed = gait.get("avg_speed_ms")
         if avg_speed is not None and avg_speed < 0.8:
@@ -702,7 +612,6 @@ class DataAggregator:
                 "message": f"Periodi di inattività prolungata (media {avg_inactivity:.0f} min/giorno)"
             })
 
-        # --- Trend: peggioramenti significativi (> 15%) ---
         significant_decline = 15
         for key, entry in trends.items():
             if (entry.get("interpretation") == "peggioramento"
@@ -717,7 +626,6 @@ class DataAggregator:
                     "message": f"{entry['label']}: {entry['change_pct']:+.1f}% rispetto al periodo precedente"
                 })
 
-        # --- Trend: miglioramenti notevoli (> 10%) ---
         for key, entry in trends.items():
             if (entry.get("interpretation") == "miglioramento"
                     and abs(entry.get("change_pct", 0)) > 10):
@@ -754,14 +662,6 @@ def _safe_mean(values):
 
 
 def _weighted_mean(pairs):
-    """
-    Media pesata da lista di (valore, peso).
-    
-    Esempio:
-      cadenza 90 con peso 83 (12 passi, high reliability)
-      cadenza 50 con peso 24 (4 passi, low reliability)
-      → risultato vicino a 90, non la media semplice 70
-    """
     clean = [(v, w) for v, w in pairs if v is not None and w is not None and w > 0]
     if not clean:
         return None
@@ -781,7 +681,6 @@ def _argmax(values):
 
 
 def _build_trend_entry(label, unit, curr_val, prev_val, higher_is_better):
-    # Converti None in 0 subito
     curr_val = curr_val if curr_val is not None else 0
     prev_val = prev_val if prev_val is not None else 0
 

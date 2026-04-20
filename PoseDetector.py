@@ -494,13 +494,13 @@ class PoseDetector:
             self._walking_exit_frames = 0
                 
         self.posture_history.append(posture)
-        
+        """
         # DEBUG: stampa 1 volta al secondo
         if self.frame_count % int(self.fps) == 0:
             print(f"[POSTURE DEBUG] mov={movement:.1f} step={self.step_activity:.1f} "
                   f"knee={knee_angle:.0f} cooldown={self._sit_cooldown}/{self._sit_cooldown_threshold} "
                   f"stepping={stepping} moving={moving} exit={self._walking_exit_frames} → {posture}")
-        
+        """
         return posture
 
     # =========================================
