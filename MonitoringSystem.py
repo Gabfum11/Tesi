@@ -52,11 +52,6 @@ class MonitoringSystem:
 
         # Calibrazione distanza (ora nel detector)
         #self.detector.load_distance_calibration()
-
-
-       
-        # Recupera la chiave
-        
         self.event_buffer = EventFrameBuffer(model="qwen2.5vl:7b")  # Buffer per eventi contestuali
         self.daily_monitor.event_buffer = self.event_buffer
         # Calcola dimensioni display
@@ -121,9 +116,6 @@ class MonitoringSystem:
 
                 # Context UNA VOLTA
                 context = self._build_vlm_context(state)
-
-                
-
                 self._update_tests(state, knee_angle, movement, frame)
 
                 # Overlay

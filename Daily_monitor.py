@@ -30,6 +30,7 @@ class DailyMonitor:
         self.num_sit_to_stand = 0
         self.num_stand_to_sit = 0
         self.num_walkings = 0
+        self._recent_transitions = deque(maxlen=10)
 
         # Sit-to-stand timing
         self.sit_to_stand_times = []
@@ -393,7 +394,8 @@ class DailyMonitor:
                     'signal_used': gait['signal_used'] if gait else None
                 }
                 self.walking_episodes.append(episode)
-
+                if hasattr(self, 'event_buffer') and self.event_buffer:
+                    self.event_buffer.on_walking_episode(episode)
                 gait_str = ""
                 if gait:
                     gait_str = (f"  Cadenza: {gait['cadence']}p/min"
@@ -436,6 +438,15 @@ class DailyMonitor:
         if new_state == "WALKING" and old_state != "WALKING":
             self.num_walkings += 1
             self._log_event("WALK_START")
+
+        # Rileva transizioni rapide SIT↔STAND (possibili tentativi falliti)
+        self._recent_transitions.append((current_time, f"{old_state}->{new_state}"))
+        sit_stand = [(t, tr) for t, tr in self._recent_transitions
+                     if "SITTING" in tr and current_time - t < 30]
+        if len(sit_stand) >= 4 and hasattr(self, 'event_buffer') and self.event_buffer:
+            window = current_time - sit_stand[0][0]
+            self.event_buffer.on_rapid_transitions(len(sit_stand), window)
+            self._recent_transitions.clear()
 
     def get_summary(self):
         """Restituisce il riepilogo da salvare nel DB.
